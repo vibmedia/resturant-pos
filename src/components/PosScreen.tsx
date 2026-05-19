@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { History, CheckCircle, Plus, Minus, Trash2, Banknote, CreditCard, Wifi, WifiOff, X } from 'lucide-react';
-import { menuData } from '../data';
+import { History, CheckCircle, Plus, Minus, Trash2, Banknote, CreditCard, Wifi, WifiOff, X, Loader2, Printer } from 'lucide-react';
 import { OrderHistory } from './OrderHistory';
 import { CartItem, MenuItem, Order, Size, User, OrderEditHistory } from '../types';
+import { API_BASE_URL } from '../config';
+import { connectPrinter, disconnectPrinter, getPrinterStatus, printReceipt, printKOT, isBluetoothSupported, PrinterStatus } from '../utils/bluetooth-printer';
 
 interface PosScreenProps {
   onLogout: () => void;
@@ -18,6 +19,8 @@ const getCategoryImageUrl = (category: string) => {
 export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
   const [activeCategory, setActiveCategory] = useState<string>('All');
   const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [categories, setCategories] = useState<any[]>([]);
+  const [isLoadingMenu, setIsLoadingMenu] = useState(true);
   
   const [cart, setCart] = useState<CartItem[]>(() => {
     const saved = localStorage.getItem('pos_cart');
@@ -44,6 +47,43 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
   const [editingOrder, setEditingOrder] = useState<Order | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  // Bluetooth printer state
+  const [printerStatus, setPrinterStatus] = useState<PrinterStatus>(getPrinterStatus());
+  const [isConnectingPrinter, setIsConnectingPrinter] = useState(false);
+  const autoPrint = localStorage.getItem('pos_auto_print') !== 'false'; // default ON
+
+  const handleConnectPrinter = useCallback(async () => {
+    setIsConnectingPrinter(true);
+    const status = await connectPrinter();
+    setPrinterStatus(status);
+    setIsConnectingPrinter(false);
+    if (status.error) {
+      setToast(`Printer: ${status.error}`);
+      setTimeout(() => setToast(null), 4000);
+    } else if (status.connected) {
+      setToast(`Connected: ${status.deviceName}`);
+      setTimeout(() => setToast(null), 3000);
+    }
+  }, []);
+
+  const handleDisconnectPrinter = useCallback(() => {
+    disconnectPrinter();
+    setPrinterStatus(getPrinterStatus());
+    setToast('Printer disconnected');
+    setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  const handlePrintOrder = useCallback(async (order: Order) => {
+    try {
+      await printReceipt(order);
+      await printKOT(order);
+      setToast('Printed!');
+    } catch (err: any) {
+      setToast(`Print failed: ${err.message}`);
+    }
+    setTimeout(() => setToast(null), 3000);
+  }, []);
+
   // Online/Offline listener
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -56,6 +96,27 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
+  }, []);
+
+  // Fetch Menu
+  useEffect(() => {
+    const fetchMenu = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/menu`);
+        if (res.ok) {
+          const data = await res.json();
+          setCategories(data.categories || []);
+          localStorage.setItem('pos_menu', JSON.stringify(data.categories));
+        }
+      } catch (e) {
+        console.error('Failed to fetch menu, falling back to local storage', e);
+        const saved = localStorage.getItem('pos_menu');
+        if (saved) setCategories(JSON.parse(saved));
+      } finally {
+        setIsLoadingMenu(false);
+      }
+    };
+    fetchMenu();
   }, []);
 
   // Sync offline orders when back online
@@ -107,13 +168,12 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
   }, [dailyNumber]);
 
   const itemsConfig = useMemo(() => {
-    const saved = localStorage.getItem('pos_menu');
-    const currentMenuOptions = saved ? JSON.parse(saved) : menuData.categories;
+    if (categories.length === 0) return [];
     if (activeCategory === 'All') {
-      return currentMenuOptions.flatMap((c: any) => c.items.map((i: any) => ({...i, category: c.name})));
+      return categories.flatMap((c: any) => c.items.map((i: any) => ({...i, category: c.name})));
     }
-    return currentMenuOptions.find((c: any) => c.name === activeCategory)?.items.map((i: any) => ({...i, category: activeCategory})) || [];
-  }, [activeCategory]);
+    return categories.find((c: any) => c.name === activeCategory)?.items.map((i: any) => ({...i, category: activeCategory})) || [];
+  }, [activeCategory, categories]);
 
   const cartTotal = cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
 
@@ -168,8 +228,11 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
     setPaymentType('cash');
   };
 
-  const placeOrder = () => {
-    if (cart.length === 0) return;
+  const [isPlacingOrder, setIsPlacingOrder] = useState(false);
+
+  const placeOrder = async () => {
+    if (cart.length === 0 || isPlacingOrder) return;
+    setIsPlacingOrder(true);
 
     if (editingOrder) {
       const editHistoryEntry: OrderEditHistory = {
@@ -207,15 +270,49 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
       setDailyNumber(prev => prev + 1);
       setToast(`Order #${String(dailyNumber).padStart(3, '0')} placed! ₹${cartTotal}`);
     }
+    const orderPayload = {
+      comment,
+      payment_type: paymentType,
+      order_source: 'pos',
+      items: cart
+    };
+
+    if (isOnline && !editingOrder) {
+      try {
+        const res = await fetch(`${API_BASE_URL}/orders`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(orderPayload)
+        });
+        if (res.ok) {
+          const data = await res.json();
+          // Use server assigned daily number if provided
+          if (data.daily_number) {
+            setDailyNumber(data.daily_number + 1);
+          }
+        }
+      } catch (e) {
+        console.error('Failed to sync order', e);
+      }
+    }
+
+    // Auto-print receipt + KOT if printer connected
+    if (autoPrint && printerStatus.connected) {
+      const orderToPrint: Order = editingOrder ? { ...editingOrder, items: [...cart], total: cartTotal, comment, paymentType } : {
+        id: Date.now().toString(), dailyNumber, items: [...cart], total: cartTotal, comment, paymentType, createdAt: Date.now(), syncStatus: 'synced'
+      };
+      handlePrintOrder(orderToPrint).catch(console.error);
+    }
 
     setCart([]);
     setComment('');
+    setIsPlacingOrder(false);
     playBeep();
     setTimeout(() => setToast(null), 3000);
   };
 
   if (showHistory) {
-    return <OrderHistory orders={orders} onClose={() => setShowHistory(false)} onEdit={handleEditOrder} />;
+    return <OrderHistory orders={orders} onClose={() => setShowHistory(false)} onEdit={handleEditOrder} onPrint={printerStatus.connected ? handlePrintOrder : undefined} />;
   }
 
   return (
@@ -234,6 +331,22 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
           </div>
           
           <div className="flex items-center gap-2">
+             {/* Bluetooth Printer Button */}
+             {isBluetoothSupported() && (
+               <button
+                 onClick={printerStatus.connected ? handleDisconnectPrinter : handleConnectPrinter}
+                 disabled={isConnectingPrinter}
+                 className={`p-1.5 rounded-full border transition-colors shadow-sm flex items-center justify-center gap-1 text-xs font-bold ${
+                   printerStatus.connected
+                     ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20'
+                     : 'bg-[#1a1a2e] border-[#e2a039]/20 text-gray-400 hover:text-[#e2a039] hover:bg-[#0f111a]'
+                 }`}
+                 title={printerStatus.connected ? `Connected: ${printerStatus.deviceName} — tap to disconnect` : 'Connect Bluetooth Printer'}
+               >
+                 {isConnectingPrinter ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />}
+                 {printerStatus.connected && <span className="hidden md:inline">{printerStatus.deviceName}</span>}
+               </button>
+             )}
              <button 
                 onClick={() => setShowHistory(true)}
                 className="p-1.5 bg-[#1a1a2e] rounded-full hover:bg-[#0f111a] border border-[#e2a039]/20 transition-colors shadow-sm flex items-center justify-center"
@@ -262,7 +375,7 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
           >
             All
           </button>
-          {menuData.categories.map(cat => (
+          {categories.map(cat => (
             <button
               key={cat.name}
               onClick={() => setActiveCategory(cat.name)}
@@ -281,47 +394,53 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
       {/* Menu Area */}
       <main className="flex-1 overflow-y-auto p-3 md:p-4 pb-[260px] bg-[#0f111a]">
         <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 max-w-[1400px] mx-auto">
-          {itemsConfig.map((item: any) => {
-            const isCombo = item.h === null;
-            return (
-              <motion.div 
-                key={item.id}
-                whileTap={{ scale: 0.95 }}
-                className={`bg-[#16213e] rounded-xl border border-[#f5f5f5]/5 flex flex-col p-2.5 justify-between overflow-hidden ${isCombo ? 'shadow-md shadow-[#e2a039]/10' : ''}`}
-              >
-                <div className="flex flex-col gap-2 mb-2">
-                  <img 
-                    src={item.imageUrl || getCategoryImageUrl(item.category)} 
-                    alt={item.name} 
-                    className="w-full h-20 object-cover rounded-md bg-[#1a1a2e] block"
-                    loading="lazy"
-                  />
-                  <h3 className={`font-bold text-xs md:text-sm leading-tight h-10 ${isCombo ? 'text-[#e2a039]' : ''}`}>{item.name}</h3>
-                </div>
-                <div className={`mt-auto ${isCombo ? '' : 'grid grid-cols-2 gap-2'}`}>
-                  {!isCombo && (
+          {isLoadingMenu ? (
+             <div className="col-span-full h-40 flex items-center justify-center">
+               <Loader2 className="animate-spin text-[#e2a039] w-8 h-8" />
+             </div>
+          ) : (
+            itemsConfig.map((item: any) => {
+              const isCombo = item.h === null;
+              return (
+                <motion.div 
+                  key={item.id}
+                  whileTap={{ scale: 0.95 }}
+                  className={`bg-[#16213e] rounded-xl border border-[#f5f5f5]/5 flex flex-col p-2.5 justify-between overflow-hidden ${isCombo ? 'shadow-md shadow-[#e2a039]/10' : ''}`}
+                >
+                  <div className="flex flex-col gap-2 mb-2">
+                    <img 
+                      src={item.imageUrl || getCategoryImageUrl(item.category)} 
+                      alt={item.name} 
+                      className="w-full h-20 object-cover rounded-md bg-[#1a1a2e] block"
+                      loading="lazy"
+                    />
+                    <h3 className={`font-bold text-xs md:text-sm leading-tight h-10 ${isCombo ? 'text-[#e2a039]' : ''}`}>{item.name}</h3>
+                  </div>
+                  <div className={`mt-auto ${isCombo ? '' : 'grid grid-cols-2 gap-2'}`}>
+                    {!isCombo && (
+                      <button 
+                        onClick={() => handleAddToCart(item, 'H')}
+                        className="bg-[#1a1a2e] hover:bg-[#e2a039]/10 border border-[#e2a039]/20 p-2 rounded-lg text-center transition-colors shadow-sm"
+                      >
+                        <span className="block text-[8px] uppercase text-[#e2a039] font-bold">Half</span>
+                        <span className="font-bold text-sm text-[#f5f5f5]">₹{item.h}</span>
+                      </button>
+                    )}
                     <button 
-                      onClick={() => handleAddToCart(item, 'H')}
-                      className="bg-[#1a1a2e] hover:bg-[#e2a039]/10 border border-[#e2a039]/20 p-2 rounded-lg text-center transition-colors shadow-sm"
+                      onClick={() => handleAddToCart(item, 'F')}
+                      className={isCombo 
+                        ? "w-full bg-[#e2a039] hover:bg-[#e2a039]/90 text-[#1a1a2e] p-2 rounded-lg text-center font-bold transition-colors shadow-sm"
+                        : "bg-[#1a1a2e] hover:bg-[#e2a039]/10 border border-[#e2a039]/20 p-2 rounded-lg text-center transition-colors shadow-sm"
+                      }
                     >
-                      <span className="block text-[8px] uppercase text-[#e2a039] font-bold">Half</span>
-                      <span className="font-bold text-sm text-[#f5f5f5]">₹{item.h}</span>
+                      {!isCombo && <span className="block text-[8px] uppercase text-[#e2a039] font-bold">Full</span>}
+                      <span className="font-bold text-sm text-[#f5f5f5]">₹{item.f}</span>
                     </button>
-                  )}
-                  <button 
-                    onClick={() => handleAddToCart(item, 'F')}
-                    className={isCombo 
-                      ? "w-full bg-[#e2a039] hover:bg-[#e2a039]/90 text-[#1a1a2e] p-2 rounded-lg text-center font-bold transition-colors shadow-sm"
-                      : "bg-[#1a1a2e] hover:bg-[#e2a039]/10 border border-[#e2a039]/20 p-2 rounded-lg text-center transition-colors shadow-sm"
-                    }
-                  >
-                    {!isCombo && <span className="block text-[8px] uppercase text-[#e2a039] font-bold">Full</span>}
-                    <span className="font-bold text-sm text-[#f5f5f5]">₹{item.f}</span>
-                  </button>
-                </div>
-              </motion.div>
-            );
-          })}
+                  </div>
+                </motion.div>
+              );
+            })
+          )}
         </div>
       </main>
 
@@ -342,7 +461,7 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
           ) : (
             <div className="flex-1 overflow-y-auto space-y-2 pr-2">
               {cart.map(item => {
-                const isComboItem = item.size === 'F' && menuData.categories.find(c => c.items.find(i => i.id === item.menuItemId))?.name === 'Combos';
+                const isComboItem = item.size === 'F' && categories.find(c => c.items.find((i: any) => i.id === item.menuItemId))?.name === 'Combos';
                 return (
                   <div key={item.id} className="flex items-center justify-between text-sm">
                     <div className="flex items-center gap-3">
@@ -406,15 +525,15 @@ export function PosScreen({ onLogout, currentUser }: PosScreenProps) {
               <span className="text-3xl md:text-4xl font-mono font-black text-[#e2a039]">₹{cartTotal}</span>
             </div>
             <button 
-              disabled={cart.length === 0}
+              disabled={cart.length === 0 || isPlacingOrder}
               onClick={placeOrder}
-              className={`h-12 md:h-16 px-4 md:px-8 rounded-xl font-black text-sm md:text-lg flex items-center gap-2 transition-all shadow-xl ${
+              className={`h-12 md:h-16 px-4 md:px-8 rounded-xl font-black text-sm md:text-lg flex items-center justify-center gap-2 transition-all shadow-xl ${
                 cart.length > 0 
                   ? 'bg-[#e2a039] text-[#1a1a2e] shadow-[#e2a039]/20 hover:scale-105 active:scale-95' 
                   : 'bg-gray-700 text-gray-500 cursor-not-allowed shadow-none'
               }`}
             >
-              {editingOrder ? 'UPDATE ORDER' : 'PLACE ORDER'} <span className="text-xl md:text-2xl">→</span>
+              {isPlacingOrder ? <Loader2 className="animate-spin w-6 h-6" /> : (editingOrder ? 'UPDATE ORDER' : 'PLACE ORDER')} {!isPlacingOrder && <span className="text-xl md:text-2xl">→</span>}
             </button>
           </div>
         </div>

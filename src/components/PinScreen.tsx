@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
-import { Lock } from 'lucide-react';
+import { Lock, Loader2 } from 'lucide-react';
 import { User } from '../types';
+import { API_BASE_URL } from '../config';
 
 interface PinScreenProps {
   onSuccess: (user: User) => void;
@@ -10,6 +11,7 @@ interface PinScreenProps {
 export function PinScreen({ onSuccess }: PinScreenProps) {
   const [pin, setPin] = useState('');
   const [error, setError] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
 
   useEffect(() => {
@@ -39,7 +41,27 @@ export function PinScreen({ onSuccess }: PinScreenProps) {
     setPin((prev) => prev.slice(0, -1));
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/auth/pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          onSuccess({ id: '1', name: pin === '1497' || pin === '0000' ? 'Admin' : 'Staff', pin, role: pin === '1497' || pin === '0000' ? 'admin' : 'staff' });
+          setLoading(false);
+          return;
+        }
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    
+    // Fallback to local users if API fails or rejects
     const user = users.find(u => u.pin === pin);
     if (user) {
       onSuccess(user);
@@ -47,6 +69,7 @@ export function PinScreen({ onSuccess }: PinScreenProps) {
       setError(true);
       setPin('');
     }
+    setLoading(false);
   };
 
   return (
@@ -104,9 +127,10 @@ export function PinScreen({ onSuccess }: PinScreenProps) {
           </button>
           <button
             onClick={handleSubmit}
-            className="h-16 rounded-xl bg-brand-accent text-brand-bg text-lg font-bold hover:opacity-90 active:scale-95 transition-all outline-none"
+            disabled={loading}
+            className="h-16 rounded-xl bg-brand-accent text-brand-bg text-lg font-bold hover:opacity-90 active:scale-95 transition-all outline-none flex items-center justify-center"
           >
-            OK
+            {loading ? <Loader2 className="animate-spin" /> : 'OK'}
           </button>
         </div>
       </motion.div>

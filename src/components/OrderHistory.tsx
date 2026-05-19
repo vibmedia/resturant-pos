@@ -1,14 +1,15 @@
 import React, { useState, useMemo } from 'react';
-import { Clock, Search, WifiOff, Cloud, Edit2 } from 'lucide-react';
+import { Clock, Search, WifiOff, Cloud, Edit2, Printer } from 'lucide-react';
 import { Order } from '../types';
 
 interface OrderHistoryProps {
   orders: Order[];
   onClose: () => void;
   onEdit: (order: Order) => void;
+  onPrint?: (order: Order) => void;
 }
 
-export function OrderHistory({ orders, onClose, onEdit }: OrderHistoryProps) {
+export function OrderHistory({ orders, onClose, onEdit, onPrint }: OrderHistoryProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [paymentFilter, setPaymentFilter] = useState<'all' | 'cash' | 'upi'>('all');
   const [dateFilter, setDateFilter] = useState('');
@@ -139,9 +140,19 @@ export function OrderHistory({ orders, onClose, onEdit }: OrderHistoryProps) {
                         onClose();
                     }} 
                     className="p-2 border border-gray-700 hover:bg-gray-700 rounded-lg text-gray-300 transition-colors"
+                    title="Edit Order"
                   >
                     <Edit2 size={18} />
                   </button>
+                  {onPrint && (
+                    <button
+                      onClick={() => onPrint(order)}
+                      className="p-2 border border-gray-700 hover:bg-emerald-500/20 hover:border-emerald-500/30 rounded-lg text-gray-300 hover:text-emerald-400 transition-colors"
+                      title="Print Receipt"
+                    >
+                      <Printer size={18} />
+                    </button>
+                  )}
                   <span className={`px-3 py-1 rounded-full text-xs font-bold uppercase ${
                     order.paymentType === 'cash' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-blue-500/20 text-blue-400'
                   }`}>
